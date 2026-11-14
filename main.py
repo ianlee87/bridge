@@ -1,8 +1,9 @@
 """Bridge: offline speech companion for people with aphasia.
 
 Live mode (normal use):
-    python main.py
+    python main.py                 (add --no-vision to skip the camera, --camera 1 for another)
       hold SPACE  = record the patient, release to stop
+      (the camera notes what the patient points at; thumbs-up picks the highlighted option)
       hold C      = record the caregiver's question (used as context next turn)
       1 / 2 / 3   = speak that option,  0 = none of these, try again
       Q or Esc    = quit
@@ -17,6 +18,7 @@ import termios
 import time
 
 from rich.console import Console
+from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
@@ -52,10 +54,15 @@ def warm_up(brain):
 
 
 def run_patient_turn(stt, brain, audio=None, wav_path=None, caregiver_question=None,
-                     pointing_at=None):
+                     pointing_at=None, pointing_method=None, vision_seconds=None):
     """Process one recording. Returns (options, timings) or (None, timings) if
-    there is nothing to choose from (empty transcript or URGENT alert)."""
+    there is nothing to choose from (empty transcript or URGENT alert).
+    pointing_at/pointing_method come from vision (or --pointing in test mode)."""
     timings = {}
+    if vision_seconds is not None:
+        timings["vision"] = vision_seconds
+        where = f"{pointing_at} ({pointing_method})" if pointing_at else "nothing"
+        console.print(f"[bold]Pointing at:[/] {where}")
 
     # 1) Speech to text
     t0 = time.perf_counter()
@@ -98,7 +105,7 @@ def run_patient_turn(stt, brain, audio=None, wav_path=None, caregiver_question=N
     # 4) Bonsai suggests 3 sentences (then the first-person filter runs)
     if caregiver_question:
         console.print(f"[bold]Context:[/] Caregiver just asked: \"{caregiver_question}\"")
-    if pointing_at:
+    if pointing_at and vision_seconds is None:      # (vision already printed it above)
         console.print(f"[bold]Context:[/] Patient is pointing at: {pointing_at}")
     t0 = time.perf_counter()
     try:
@@ -212,10 +219,18 @@ class Keys:
         while not self.events.empty():
             self.events.get_nowait()
 
-    def wait_down(self, allowed):
-        """Block until one of the `allowed` keys is pressed; return its name."""
+    def wait_down(self, allowed, timeout=None):
+        """Wait until one of the `allowed` keys is pressed and return its name.
+        With a timeout (seconds), return None if no allowed key came in time."""
+        deadline = None if timeout is None else time.time() + timeout
         while True:
-            kind, name = self.events.get()
+            remaining = None if deadline is None else deadline - time.time()
+            if remaining is not None and remaining <= 0:
+                return None
+            try:
+                kind, name = self.events.get(timeout=remaining)
+            except queue.Empty:
+                return None
             if kind == "down" and name in allowed:
                 return name
 
@@ -237,8 +252,60 @@ def record_while_held(keys, recorder, key, label):
     return audio
 
 
-def run_live():
+HIGHLIGHT_STEP_S = 2.5    # thumbs-up mode: highlight moves to the next option this often
+
+
+def start_vision(camera_index):
+    """Start the camera thread. Returns the Vision object, or None if it failed."""
+    console.print("[dim]Starting camera...[/]")
+    try:
+        from vision import Vision      # imported here so --no-vision never loads YOLO
+        vision = Vision(camera_index)
+        ok, message = vision.start()
+    except Exception as e:
+        ok, message = False, f"{type(e).__name__}: {e}"
+    if not ok:
+        console.print(f"[bold yellow]Vision is off: {message}[/]\n"
+                      "Bridge will keep running without pointing or thumbs-up.")
+        return None
+    console.print(f"[green]Vision on[/] [dim]({message})[/]")
+    return vision
+
+
+def wait_for_pick(keys, options, vision):
+    """Wait for the patient's pick. Returns (number, how): 0 = try again.
+    Keys 1/2/3/0 always work. With vision on, a highlight steps through the
+    options every HIGHLIGHT_STEP_S seconds and a thumbs-up picks the highlighted one."""
+    keys.clear()
+    allowed = {"0"} | {str(i) for i in range(1, len(options) + 1)}
+    if vision is None:
+        console.print("[bold]Pick 1, 2, 3, or 0 to try again.[/]")
+        return int(keys.wait_down(allowed)), "key"
+
+    console.print("[bold]Pick 1, 2, 3, or 0 to try again. Or thumbs-up on the highlighted one.[/]")
+    thumbs_before = vision.get_thumbs_up_count()   # only a NEW thumbs-up counts
+    highlight = 0                                  # index into options (0 = option 1)
+    next_step = time.time() + HIGHLIGHT_STEP_S
+
+    def line():
+        return f"[black on yellow] ▶ {highlight + 1}  {options[highlight]} [/]  [dim]thumbs-up to pick[/]"
+
+    with Live(line(), console=console, refresh_per_second=10, transient=True) as live:
+        while True:
+            key = keys.wait_down(allowed, timeout=0.1)
+            if key is not None:
+                return int(key), "key"
+            if vision.get_thumbs_up_count() > thumbs_before:
+                return highlight + 1, "thumbs-up"
+            if time.time() >= next_step:
+                highlight = (highlight + 1) % len(options)
+                next_step = time.time() + HIGHLIGHT_STEP_S
+                live.update(line())
+
+
+def run_live(use_vision=True, camera_index=0):
     stt, brain, recorder = Transcriber(), Brain(), PushToTalkRecorder()
+    vision = start_vision(camera_index) if use_vision else None
     warm_up(brain)
     keys = Keys()
     if not keys.trusted:
@@ -277,9 +344,21 @@ def run_live():
             console.print("[yellow]Too short, try again.[/]")
             continue
         console.print(f"[dim]audio length: {len(audio) / SAMPLE_RATE:.1f} s[/]")
+
+        # What was the patient pointing at when they let go of SPACE?
+        pointing_at = pointing_method = vision_seconds = None
+        if vision:
+            t0 = time.perf_counter()
+            target = vision.current_target()
+            vision_seconds = time.perf_counter() - t0
+            if target:
+                pointing_at, pointing_method = target["label"], target["method"]
         try:
             options, _ = run_patient_turn(stt, brain, audio=audio,
-                                          caregiver_question=caregiver_question)
+                                          caregiver_question=caregiver_question,
+                                          pointing_at=pointing_at,
+                                          pointing_method=pointing_method,
+                                          vision_seconds=vision_seconds)
         except Exception as e:
             console.print(f"[red]Speech-to-text failed: {e}. Is WhisperKit running on port 50060?[/]")
             continue
@@ -291,14 +370,12 @@ def run_live():
             keys.wait_down({"0", "1", "2", "3", "space"})
             continue
 
-        # Patient picks. Nothing is spoken without a pick.
-        console.print("[bold]Pick 1, 2, 3, or 0 to try again.[/]")
-        keys.clear()
-        allowed = {"0"} | {str(i) for i in range(1, len(options) + 1)}
-        pick = int(keys.wait_down(allowed))
+        # Patient picks (key or thumbs-up). Nothing is spoken without a pick.
+        pick, how = wait_for_pick(keys, options, vision)
         if pick == 0:
             console.print("[yellow]OK, let's try again.[/]")
             continue        # keep the caregiver question for the retry
+        console.print(f"[bold]Picked {pick}[/] [dim](by {how})[/]")
         speak_choice(options, pick)
         caregiver_question = None   # that question has been answered
 
@@ -309,6 +386,8 @@ def main():
     parser.add_argument("--pick", type=int, help="test mode: option to speak (1-3, or 0)")
     parser.add_argument("--caregiver", help="test mode: caregiver question for context")
     parser.add_argument("--pointing", help="test mode: object the patient points at, e.g. cup")
+    parser.add_argument("--no-vision", action="store_true", help="live mode: don't use the camera")
+    parser.add_argument("--camera", type=int, default=0, help="live mode: camera number (default 0)")
     args = parser.parse_args()
 
     if args.wav:
@@ -322,7 +401,7 @@ def main():
     new[3] &= ~termios.ECHO
     termios.tcsetattr(fd, termios.TCSADRAIN, new)
     try:
-        run_live()
+        run_live(use_vision=not args.no_vision, camera_index=args.camera)
     except KeyboardInterrupt:
         pass
     finally:

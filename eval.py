@@ -119,9 +119,42 @@ def generate():
                     default=0.0), 2)
             rows.append(row)
             console.print(f"[dim]case {number:>2} {run:<16} done[/]")
+    keep_old_judgments(rows)
     save(rows)
     console.print(f"Saved {len(rows)} rows to {RESULTS_CSV}\n")
     return rows
+
+
+def options_of(row):
+    """The row's options, sorted, so the same options in a new order count as unchanged."""
+    return sorted(row.get(f"option_{i}") or "" for i in (1, 2, 3))
+
+
+def keep_old_judgments(rows):
+    """Compare with the previous eval_results.csv (if any).
+    - Same options as last time: copy your old y/n, so you don't judge it twice.
+    - Different options: print what changed, and leave it for you to judge."""
+    try:
+        old = {(r["case"], r["run"]): r for r in load_results()}
+    except FileNotFoundError:
+        return
+    changed = 0
+    for row in rows:
+        before = old.get((str(row["case"]), row["run"]))
+        if not before or row["run"] == "urgent":
+            continue
+        if options_of(before) == options_of(row):
+            row["judge"] = before.get("judge", "")
+            continue
+        changed += 1
+        console.print(f"[bold]Changed: case {row['case']} ({row['run']})[/]  {row['fragments']}")
+        for o in options_of(before):
+            if o and o not in options_of(row):
+                console.print(f"  [red]- {o}[/]")
+        for o in options_of(row):
+            if o and o not in options_of(before):
+                console.print(f"  [green]+ {o}[/]")
+    console.print(f"\n{changed} rows changed since last run (those need judging again).")
 
 
 def save(rows):
@@ -141,6 +174,12 @@ def load_results():
 # Step 2: you judge each row with y / n
 # ---------------------------------------------------------------------------
 
+def show_score(row):
+    """Keyword score as text. (0.0 is a real score, so don't treat it as empty.)"""
+    score = row.get("keyword_score")
+    return "-" if score in (None, "") else str(score)
+
+
 def show_row(row):
     console.rule(f"[bold]Case {row['case']}  ({row['run']})")
     console.print(f"Caregiver asked: {row['caregiver'] or '-'}")
@@ -152,7 +191,7 @@ def show_row(row):
             console.print(f"  {i}. {row[f'option_{i}']}")
     if row.get("filtered_out"):
         console.print(f"[dim]  filtered out: {row['filtered_out']}[/]")
-    console.print(f"[dim]  keyword score: {row.get('keyword_score') or '-'}[/]")
+    console.print(f"[dim]  keyword score: {show_score(row)}[/]")
 
 
 def judge(rows):
@@ -190,7 +229,7 @@ def summary(rows):
 
     def cell(row):
         mark = {"y": "[green]y[/]", "n": "[red]n[/]"}.get(row.get("judge"), "[yellow]?[/]")
-        return f"{mark}  [dim]kw {row.get('keyword_score') or '-'}[/]"
+        return f"{mark}  [dim]kw {show_score(row)}[/]"
 
     by_run = {"with pointing": [], "without pointing": []}
     for row in rows:

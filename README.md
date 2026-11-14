@@ -6,8 +6,9 @@ Everything runs on this Mac. It works with Wi-Fi off.
 
 ```
 hold SPACE -> WhisperKit (speech to text) -> split on pauses -> urgent check
-           -> Bonsai (3 options) -> first-person filter -> patient picks 1/2/3
-           -> argmax-cli speaks it
+           -> + what the camera sees the patient pointing at
+           -> Bonsai (3 options) -> first-person filter
+           -> patient picks 1/2/3 (or thumbs-up) -> argmax-cli speaks it
 ```
 
 ## Files
@@ -18,6 +19,8 @@ hold SPACE -> WhisperKit (speech to text) -> split on pauses -> urgent check
 | `audio.py` | Push-to-talk recording, WhisperKit speech-to-text, argmax-cli speech |
 | `fragments.py` | Splits words into fragments at pauses > 0.6 s; urgent keyword rule |
 | `brain.py` | Bonsai prompt, 5 worked examples, JSON parsing, first-person filter, warm-up |
+| `vision.py` | Webcam + YOLO + MediaPipe hands: pointing target and thumbs-up. Run alone for a debug window |
+| `models/hand_landmarker.task` | MediaPipe hand model (not in git; see setup) |
 | `eval.py` | Scores Bonsai on the 15 test cases from text (no audio needed) |
 | `test_phrases.txt` | 15 scored test cases: caregiver question, fragments, pointed-at object, expected sentence |
 
@@ -28,8 +31,15 @@ hold SPACE -> WhisperKit (speech to text) -> split on pauses -> urgent check
 ```bash
 cd ~/bridge
 python3 -m venv .venv
-.venv/bin/pip install openai sounddevice numpy rich pynput
+.venv/bin/pip install openai sounddevice numpy rich pynput ultralytics mediapipe opencv-python
 ```
+
+Vision needs two model files in `~/bridge` (both are kept out of git):
+- `yolov8n.pt`: the YOLO object model
+- `models/hand_landmarker.task`: the MediaPipe hand model. Copy it from lamp-vision:
+  `mkdir -p models && cp ~/lamp-vision/models/hand_landmarker.task models/`
+
+Bridge sets `YOLO_OFFLINE=1`, so YOLO never tries the internet.
 
 **2. Argmax speech binary.** Bridge calls the prebuilt
 `~/argmax-oss-swift/.build/release/argmax-cli` directly. That's faster than
@@ -47,6 +57,7 @@ your terminal app (Terminal, iTerm, VS Code…) under:
 - **Input Monitoring**: lets Bridge see SPACE and C being held down and released
 - **Accessibility**: also needed by the keyboard library on macOS
 - **Microphone**: to record
+- **Camera**: for pointing and thumbs-up (skip with `--no-vision`)
 
 Quit and reopen the terminal after changing these. If Input Monitoring is off,
 Bridge prints a yellow warning and the keys do nothing.
@@ -65,10 +76,13 @@ Bridge prints a yellow warning and the keys do nothing.
 
 ```bash
 cd ~/bridge
-.venv/bin/python main.py
+.venv/bin/python main.py               # with the camera (camera 0)
+.venv/bin/python main.py --camera 1    # use a different camera
+.venv/bin/python main.py --no-vision   # no camera at all
 ```
 
-On start, Bridge sends Bonsai a tiny request so the model is loaded (**Bonsai warm**),
+If the camera can't open, Bridge prints a yellow warning and keeps running
+without vision. On start, Bridge sends Bonsai a tiny request so the model is loaded (**Bonsai warm**),
 then silently runs argmax-cli once on the word "ready" so the first spoken
 sentence isn't slow (**Speech warm**). Both print how long they took.
 
@@ -80,17 +94,58 @@ sentence isn't slow (**Speech warm**). Both print how long they took.
 | **0** | None of these, try again (nothing is spoken) |
 | **Q** / **Esc** | Quit |
 
-Nothing is ever spoken unless the patient presses 1, 2 or 3.
+Nothing is ever spoken unless the patient picks: key 1, 2 or 3, or a thumbs-up.
+
+### Pointing (vision)
+
+While the patient speaks, they can point at something (cup, remote, tv, book…).
+When SPACE is released, Bridge takes what the camera thinks they're pointing at
+and gives it to Bonsai ("Patient is pointing at: cup"). The terminal shows
+`Pointing at: cup (ray)` and a `vision` time. The method says how it was found:
+
+| Method | Meaning |
+|---|---|
+| `ray` | A line from the index knuckle through the fingertip hits that object first |
+| `nearest` | The line hit nothing, so it's the object closest to the fingertip (within 150 px) |
+| `held` | No hand visible, so it's the biggest object near the middle of the picture (held up to the camera) |
+
+An object only counts after it has been the target for about 0.5 s, and it is
+forgotten 2 s after it stops being seen. People are never a target.
+
+### Thumbs-up to pick
+
+With vision on, after the options appear a yellow highlight starts on option 1
+and moves to the next option every 2.5 s. Hold a thumbs-up for about 0.7 s
+to pick the highlighted option. The keys 1/2/3/0 still work at any time.
+Only a thumbs-up that starts after the options appear counts.
+
+### Testing vision alone
+
+```bash
+.venv/bin/python vision.py             # debug window, q = quit
+.venv/bin/python vision.py --camera 1
+```
+
+You should see green boxes with labels around objects. A pink dot marks your
+index fingertip, and a pink line runs from the knuckle through the fingertip.
+The target's box turns yellow, and the top bar says e.g. `pointing at: cup (ray)`.
+Hold a thumbs-up and `thumbs up 50%` counts up to `THUMBS UP!`. The terminal
+prints the FPS every 2 s and each change of target. If the picture is black,
+try `--camera 1`.
 
 ### First-person filter
 
 After Bonsai answers, options that sound like someone talking *to* the patient
 are dropped:
-- they start with "Do you", "Would you" or "Are you", **or**
-- they contain "you/your" but no "I/me/my".
+1. they ask the patient something: start with "Do you", "Would you like" or "Are you"
+2. they say "your" (the patient's), e.g. "Is it your son?"
+3. **kept:** requests to the caregiver that start with "Could you", "Would you",
+   "Can you" or "Please", e.g. "Could you change the channel?"
+4. otherwise they're dropped if they contain "you" but no "I/me/my"
 
-So "Could I have a blanket?" and "Can you help me call my daughter?" are kept,
-while "Do you want cold water?" and "Can you turn that down?" are dropped.
+The checks run in that order. So "Could I have a blanket?", "Can you turn that down?"
+and "Would you give me that hot drink?" are kept, while "Do you want cold water?"
+and "Would you like a drink?" are dropped.
 
 The filter is skipped if the patient's fragments contain
 who/what/where/when/why/how. Whisper's "?" is ignored, because it adds one
@@ -136,6 +191,9 @@ Only LM Studio is needed (no WhisperKit, no audio). Run it in a terminal.
    **y** (an option says what the patient meant), **n**, **s** (skip) or
    **q** (save and quit). Each answer is saved right away. `--judge` only asks
    about rows that aren't marked yet; to redo one, clear its `judge` cell in the CSV.
+   When you rerun eval.py, rows whose options didn't change keep your old y/n
+   (same options in a different order count as unchanged). Changed rows are
+   printed with `-` old / `+` new lines and need judging again.
    The URGENT case is judged automatically (did the alert fire?).
 3. **Summary:** your hit rate with vs. without pointing, side by side, plus the
    keyword-overlap score as a rough second column, and average Bonsai time.

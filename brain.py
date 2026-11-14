@@ -100,9 +100,12 @@ def parse_options(raw):
 
 # Goal: keep sentences the PATIENT would say, drop ones said TO the patient.
 #   keep: "Could I have a blanket?"   "Can you help me call my daughter?"
-#   drop: "Do you want cold water?"   "Can you turn that down?" (no I/me/my)
-AIMED_AT_PATIENT_STARTS = ("do you", "would you", "are you")
-YOU_WORDS = {"you", "your", "yours", "yourself"}
+#         "Could you change the channel?"  "Please turn it down."   (requests to the caregiver)
+#   drop: "Do you want cold water?"   "Would you like a drink?"  "Is it your son?"
+ASKS_PATIENT_STARTS = ("do you", "would you like", "are you")      # questions TO the patient
+REQUEST_STARTS = ("could you", "would you", "can you", "please")   # patient asking caregiver
+YOUR_WORDS = {"your", "yours", "yourself"}                         # "your" = the patient's
+YOU_WORDS = {"you"}
 FIRST_PERSON_WORDS = {"i", "me", "my", "mine", "myself"}
 QUESTION_WORDS = {"who", "what", "where", "when", "why", "how"}
 
@@ -120,12 +123,20 @@ def fragments_are_question(fragments):
 
 
 def is_aimed_at_patient(option):
-    """True if this option sounds like someone talking TO the patient."""
-    text = option.strip().lower()
-    if text.startswith(AIMED_AT_PATIENT_STARTS):
-        return True
+    """True if this option sounds like someone talking TO the patient.
+    The checks run in order; the first one that matches decides."""
+    text = option.strip().lower().replace("’", "'")
     words = words_in(text)
-    # Mentions "you" but never "I/me/my": probably not the patient speaking.
+    # 1. Asks the patient something: "Do you want...", "Would you like...", "Are you..."
+    if text.startswith(ASKS_PATIENT_STARTS):
+        return True
+    # 2. Says "your", which here means the patient's ("your son", "your wife").
+    if words & YOUR_WORDS:
+        return True
+    # 3. A request the patient makes to the caregiver: "Could you...", "Please..."
+    if text.startswith(REQUEST_STARTS):
+        return False
+    # 4. Mentions "you" but never "I/me/my": probably not the patient speaking.
     return bool(words & YOU_WORDS) and not (words & FIRST_PERSON_WORDS)
 
 
