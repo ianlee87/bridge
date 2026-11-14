@@ -1,7 +1,8 @@
 """Bridge: offline speech companion for people with aphasia.
 
 Live mode (normal use):
-    python main.py                 (add --no-vision to skip the camera, --camera 1 for another)
+    python main.py                 (shows the camera window; --camera 1 for another camera,
+                                    --no-window to hide the window, --no-vision for no camera)
       hold SPACE  = record the patient, release to stop
       (the camera notes what the patient points at; thumbs-up picks the highlighted option)
       hold C      = record the caregiver's question (used as context next turn)
@@ -255,13 +256,18 @@ def record_while_held(keys, recorder, key, label):
 HIGHLIGHT_STEP_S = 2.5    # thumbs-up mode: highlight moves to the next option this often
 
 
-def start_vision(camera_index):
-    """Start the camera thread. Returns the Vision object, or None if it failed."""
+WINDOW_TITLE = "Bridge camera"
+
+
+def start_vision(camera_index, background=True):
+    """Open the camera and load the vision models. Returns the Vision object, or
+    None if it failed. background=True also starts vision's own thread; with
+    background=False the caller must call vision.step() itself (window mode)."""
     console.print("[dim]Starting camera...[/]")
     try:
         from vision import Vision      # imported here so --no-vision never loads YOLO
         vision = Vision(camera_index)
-        ok, message = vision.start()
+        ok, message = vision.start() if background else vision.open()
     except Exception as e:
         ok, message = False, f"{type(e).__name__}: {e}"
     if not ok:
@@ -290,24 +296,30 @@ def wait_for_pick(keys, options, vision):
     def line():
         return f"[black on yellow] ▶ {highlight + 1}  {options[highlight]} [/]  [dim]thumbs-up to pick[/]"
 
-    with Live(line(), console=console, refresh_per_second=10, transient=True) as live:
-        while True:
-            key = keys.wait_down(allowed, timeout=0.1)
-            if key is not None:
-                return int(key), "key"
-            if vision.get_thumbs_up_count() > thumbs_before:
-                return highlight + 1, "thumbs-up"
-            if time.time() >= next_step:
-                highlight = (highlight + 1) % len(options)
-                next_step = time.time() + HIGHLIGHT_STEP_S
-                live.update(line())
+    # The highlight is shown in two places: this terminal line, and the camera
+    # window (if it's open), where the options are drawn at the bottom.
+    vision.set_pick_overlay(options, highlight)
+    try:
+        with Live(line(), console=console, refresh_per_second=10, transient=True) as live:
+            while True:
+                key = keys.wait_down(allowed, timeout=0.1)
+                if key is not None:
+                    return int(key), "key"
+                if vision.get_thumbs_up_count() > thumbs_before:
+                    return highlight + 1, "thumbs-up"
+                if time.time() >= next_step:
+                    highlight = (highlight + 1) % len(options)
+                    next_step = time.time() + HIGHLIGHT_STEP_S
+                    live.update(line())
+                    vision.set_pick_overlay(options, highlight)
+    finally:
+        vision.set_pick_overlay(None, 0)     # picking is over: hide the options
 
 
-def run_live(use_vision=True, camera_index=0):
+def run_live(vision, keys):
+    """The keyboard + voice loop. `vision` may be None (no camera)."""
     stt, brain, recorder = Transcriber(), Brain(), PushToTalkRecorder()
-    vision = start_vision(camera_index) if use_vision else None
     warm_up(brain)
-    keys = Keys()
     if not keys.trusted:
         console.print("[bold yellow]macOS has not allowed this terminal to read the keyboard.[/]\n"
                       "Open System Settings > Privacy & Security > Input Monitoring "
@@ -380,6 +392,55 @@ def run_live(use_vision=True, camera_index=0):
         caregiver_question = None   # that question has been answered
 
 
+def run_with_window(camera_index, keys):
+    """Live mode with the camera window.
+
+    macOS only lets the MAIN thread draw windows, so here the jobs are swapped:
+      main thread       - camera + YOLO + hands each frame, and cv2.imshow()
+      background thread - the keyboard + voice loop (run_live)
+    The two share the Vision object (its values are protected by a lock)."""
+    import threading
+
+    import cv2
+    from vision import MAX_FPS
+
+    vision = start_vision(camera_index, background=False)
+    if vision is None:                    # no camera: same as --no-vision
+        run_live(None, keys)
+        return
+
+    voice_done = threading.Event()
+
+    def voice_thread():
+        try:
+            run_live(vision, keys)
+        except Exception as e:            # show the error instead of dying silently
+            console.print(f"[red]Bridge stopped: {type(e).__name__}: {e}[/]")
+        finally:
+            voice_done.set()              # tells the main thread to close the window
+
+    threading.Thread(target=voice_thread, daemon=True).start()
+
+    try:
+        while not voice_done.is_set():
+            started = time.time()
+            picture = vision.step(draw=True)
+            if picture is None:
+                console.print("[bold yellow]The camera stopped sending pictures. "
+                              "Closing the window; Bridge keeps running without vision.[/]")
+                break
+            cv2.imshow(WINDOW_TITLE, picture)
+            cv2.waitKey(1)                # lets macOS actually draw the window
+            time.sleep(max(0.0, 1 / MAX_FPS - (time.time() - started)))
+    finally:
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)
+        vision.cap.release()
+    # If the camera died, keep waiting for the voice loop (Q / Esc / Ctrl+C ends it).
+    while not voice_done.wait(0.2):
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(description="Bridge: aphasia speech companion")
     parser.add_argument("--wav", help="test mode: process this WAV file instead of the mic")
@@ -388,6 +449,8 @@ def main():
     parser.add_argument("--pointing", help="test mode: object the patient points at, e.g. cup")
     parser.add_argument("--no-vision", action="store_true", help="live mode: don't use the camera")
     parser.add_argument("--camera", type=int, default=0, help="live mode: camera number (default 0)")
+    parser.add_argument("--no-window", action="store_true",
+                        help="live mode: use the camera but don't show its window")
     args = parser.parse_args()
 
     if args.wav:
@@ -401,7 +464,14 @@ def main():
     new[3] &= ~termios.ECHO
     termios.tcsetattr(fd, termios.TCSADRAIN, new)
     try:
-        run_live(use_vision=not args.no_vision, camera_index=args.camera)
+        # The keyboard listener is created here, on the main thread, in every mode.
+        keys = Keys()
+        if args.no_vision:
+            run_live(None, keys)
+        elif args.no_window:
+            run_live(start_vision(args.camera, background=True), keys)
+        else:
+            run_with_window(args.camera, keys)
     except KeyboardInterrupt:
         pass
     finally:

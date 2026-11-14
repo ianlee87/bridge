@@ -170,6 +170,8 @@ class Vision:
         self.thumbs_last_seen = 0.0
         self.thumbs_fired = False          # already counted this thumbs-up?
         self.fps = 0.0
+        self._fps_frames, self._fps_start = 0, time.time()
+        self._pick = None                  # (options, highlighted index) shown at the bottom
 
     # ---------- setup ----------
     def open(self):
@@ -222,6 +224,10 @@ class Vision:
         height, width = frame.shape[:2]
         now = time.time()
         self.frame_no += 1
+        self._fps_frames += 1                       # FPS, measured over each second
+        if now - self._fps_start >= 1.0:
+            self.fps = self._fps_frames / (now - self._fps_start)
+            self._fps_frames, self._fps_start = 0, now
 
         # 1) YOLO objects (every Nth frame), ignoring people
         if self.frame_no % YOLO_EVERY_N == 1 or YOLO_EVERY_N == 1:
@@ -292,6 +298,12 @@ class Vision:
         with self.lock:
             return self.thumbs_up_count
 
+    def set_pick_overlay(self, options, highlight):
+        """Show these options at the bottom of the window, `highlight` (0-based) in yellow.
+        Pass options=None to hide them. Safe to call from another thread."""
+        with self.lock:
+            self._pick = (list(options), highlight) if options else None
+
     # ---------- background thread (used by main.py) ----------
     def start(self):
         """Open the camera and start processing in the background. Returns (ok, message)."""
@@ -341,10 +353,38 @@ class Vision:
         if self.thumbs_since is not None:
             held = min(1.0, (time.time() - self.thumbs_since) / THUMBS_UP_HOLD_S)
             label = "THUMBS UP!" if self.thumbs_fired else f"thumbs up {held:.0%}"
-            cv2.putText(frame, label, (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 0), 3)
-        cv2.putText(frame, f"{self.fps:.1f} FPS  YOLO:{self.device}",
-                    (20, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(frame, label, (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 0), 3)
+        fps_text = f"{self.fps:.1f} FPS  YOLO:{self.device}"
+        (text_w, _), _ = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        cv2.putText(frame, fps_text, (frame.shape[1] - text_w - 20, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+        with self.lock:
+            pick = self._pick
+        if pick:
+            self._draw_options(frame, *pick)
         return frame
+
+    def _draw_options(self, frame, options, highlight):
+        """The options at the bottom of the picture; the highlighted one in yellow."""
+        height, width = frame.shape[:2]
+        row_h = 54
+        top = height - row_h * len(options) - 16
+        for i, option in enumerate(options):
+            y1 = top + i * row_h
+            if i == highlight:
+                background, text_color = (0, 215, 255), (0, 0, 0)        # yellow, black text
+            else:
+                background, text_color = (40, 40, 40), (255, 255, 255)   # dark grey, white text
+            cv2.rectangle(frame, (12, y1), (width - 12, y1 + row_h - 6), background, -1)
+            # OpenCV fonts are plain ASCII: swap curly quotes, drop anything else.
+            text = f"{i + 1}  " + option.replace("’", "'").replace("“", '"') \
+                .replace("”", '"').encode("ascii", "ignore").decode()
+            scale = 1.0
+            while scale > 0.5 and cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX,
+                                                  scale, 2)[0][0] > width - 60:
+                scale -= 0.05                    # shrink long sentences to fit
+            cv2.putText(frame, text, (28, y1 + row_h - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                        scale, text_color, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +402,7 @@ def main():
     if not ok:
         return
     print("Point at things (cup, bottle, remote, tv, book...). Thumbs-up to test. q = quit.")
-    frames, fps_start, last_print = 0, time.time(), time.time()
+    last_print = time.time()
     last_target, last_thumbs = None, 0
     while True:
         started = time.time()
@@ -374,11 +414,6 @@ def main():
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
-        # FPS, measured over each second
-        frames += 1
-        if time.time() - fps_start >= 1.0:
-            vision.fps = frames / (time.time() - fps_start)
-            frames, fps_start = 0, time.time()
         if time.time() - last_print >= 2.0:
             print(f"FPS {vision.fps:.1f}")
             last_print = time.time()

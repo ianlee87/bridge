@@ -19,7 +19,7 @@ hold SPACE -> WhisperKit (speech to text) -> split on pauses -> urgent check
 | `audio.py` | Push-to-talk recording, WhisperKit speech-to-text, argmax-cli speech |
 | `fragments.py` | Splits words into fragments at pauses > 0.6 s; urgent keyword rule |
 | `brain.py` | Bonsai prompt, 5 worked examples, JSON parsing, first-person filter, warm-up |
-| `vision.py` | Webcam + YOLO + MediaPipe hands: pointing target and thumbs-up. Run alone for a debug window |
+| `vision.py` | Webcam + YOLO + MediaPipe hands: pointing target, thumbs-up, and the camera window drawing. Run alone to test just vision |
 | `models/hand_landmarker.task` | MediaPipe hand model (not in git; see setup) |
 | `eval.py` | Scores Bonsai on the 15 test cases from text (no audio needed) |
 | `test_phrases.txt` | 15 scored test cases: caregiver question, fragments, pointed-at object, expected sentence |
@@ -76,13 +76,26 @@ Bridge prints a yellow warning and the keys do nothing.
 
 ```bash
 cd ~/bridge
-.venv/bin/python main.py               # with the camera (camera 0)
+.venv/bin/python main.py               # camera 0, with the camera window
 .venv/bin/python main.py --camera 1    # use a different camera
+.venv/bin/python main.py --no-window   # camera on, but no window
 .venv/bin/python main.py --no-vision   # no camera at all
 ```
 
+By default a **camera window** opens next to the terminal. It shows the object
+boxes, the fingertip and its ray, and `pointing at: X (method)` along the top.
+While the patient is picking, the options are drawn along the bottom with the
+current one highlighted in yellow. Keys still work while the window is in front.
+
+How it works: macOS only lets the main thread of a program draw windows. So
+with the window on, the main thread runs the camera and the window, and the
+keyboard + voice loop runs in a background thread. With `--no-window` it's the
+other way round: the voice loop is on the main thread and the camera runs in
+the background.
+
 If the camera can't open, Bridge prints a yellow warning and keeps running
-without vision. On start, Bridge sends Bonsai a tiny request so the model is loaded (**Bonsai warm**),
+without vision or window. If the camera stops partway through, the window
+closes and Bridge keeps running without vision. On start, Bridge sends Bonsai a tiny request so the model is loaded (**Bonsai warm**),
 then silently runs argmax-cli once on the word "ready" so the first spoken
 sentence isn't slow (**Speech warm**). Both print how long they took.
 
