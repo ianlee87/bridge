@@ -20,7 +20,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from audio import SAMPLE_RATE, PushToTalkRecorder, Transcriber, speak
+from audio import SAMPLE_RATE, PushToTalkRecorder, Transcriber, speak, warm_up_tts
 from brain import LLM_MODEL, Brain
 from fragments import check_urgent, make_fragments
 
@@ -36,13 +36,19 @@ def ms(seconds):
 # ---------------------------------------------------------------------------
 
 def warm_up(brain):
-    """Load Bonsai into memory now, so the patient's first turn isn't slow."""
+    """Get Bonsai and the speech engine ready now, so the patient's first turn isn't slow."""
     t0 = time.perf_counter()
     try:
         brain.warm_up()
         console.print(f"[green]Bonsai warm[/] [dim]({ms(time.perf_counter() - t0)})[/]")
     except Exception as e:
         console.print(f"[red]Bonsai warm-up failed: {e}. Is LM Studio running on port 1235?[/]")
+
+    t0 = time.perf_counter()
+    if warm_up_tts():
+        console.print(f"[green]Speech warm[/] [dim]({ms(time.perf_counter() - t0)})[/]")
+    else:
+        console.print("[yellow]Speech warm-up failed; the first sentence may be slow.[/]")
 
 
 def run_patient_turn(stt, brain, audio=None, wav_path=None, caregiver_question=None,

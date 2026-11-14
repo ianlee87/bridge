@@ -62,8 +62,8 @@ OPTIONS_SCHEMA = {
 }
 
 # Extra instruction added only when we re-ask after the filter dropped too many.
-RETRY_NOTE = ("Your last options were questions to the patient. Write 3 sentences "
-              "the PATIENT would say, in first person (I, my, me).")
+RETRY_NOTE = ("Your last options were spoken TO the patient. Write 3 sentences "
+              "the PATIENT would say, in first person (I, me, my).")
 
 
 def build_user_message(fragments, caregiver_question=None, pointing_at=None):
@@ -98,32 +98,42 @@ def parse_options(raw):
 
 # ---------- First-person filter (plain Python) ----------
 
-QUESTION_STARTS = ("do you", "would you", "are you", "can you")
-QUESTION_WORDS = {"who", "what", "where", "when", "why", "how", "which"}
+# Goal: keep sentences the PATIENT would say, drop ones said TO the patient.
+#   keep: "Could I have a blanket?"   "Can you help me call my daughter?"
+#   drop: "Do you want cold water?"   "Can you turn that down?" (no I/me/my)
+AIMED_AT_PATIENT_STARTS = ("do you", "would you", "are you")
+YOU_WORDS = {"you", "your", "yours", "yourself"}
+FIRST_PERSON_WORDS = {"i", "me", "my", "mine", "myself"}
+QUESTION_WORDS = {"who", "what", "where", "when", "why", "how"}
+
+
+def words_in(text):
+    """Lowercase words. Apostrophes split words, so "I'd" gives "i" and "d"."""
+    return set(re.findall(r"[a-z]+", text.lower().replace("’", "'")))
 
 
 def fragments_are_question(fragments):
-    """True if the patient seems to be asking something: a fragment ends in "?"
-    or contains a question word like "where" or "who"."""
-    for frag in fragments:
-        if frag.strip().endswith("?"):
-            return True
-        if set(re.findall(r"[a-z]+", frag.lower())) & QUESTION_WORDS:
-            return True
-    return False
+    """True if the patient seems to be asking something, i.e. a fragment contains
+    who/what/where/when/why/how. Whisper's "?" is ignored: it adds one whenever
+    the voice goes up ("Want?"), which doesn't mean the patient asked anything."""
+    return any(words_in(frag) & QUESTION_WORDS for frag in fragments)
 
 
-def is_question_to_patient(option):
-    """True if this option reads like a question, not something the patient would say."""
+def is_aimed_at_patient(option):
+    """True if this option sounds like someone talking TO the patient."""
     text = option.strip().lower()
-    return text.endswith("?") or text.startswith(QUESTION_STARTS)
+    if text.startswith(AIMED_AT_PATIENT_STARTS):
+        return True
+    words = words_in(text)
+    # Mentions "you" but never "I/me/my": probably not the patient speaking.
+    return bool(words & YOU_WORDS) and not (words & FIRST_PERSON_WORDS)
 
 
 def first_person_filter(options, fragments):
-    """Drop question-style options, unless the patient was asking a question."""
+    """Drop options aimed at the patient, unless the patient was asking a question."""
     if fragments_are_question(fragments):
         return list(options)
-    return [o for o in options if not is_question_to_patient(o)]
+    return [o for o in options if not is_aimed_at_patient(o)]
 
 
 class Brain:

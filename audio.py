@@ -116,6 +116,31 @@ class Transcriber:
             os.remove(path)
 
 
+def warm_up_tts(timeout_s=60):
+    """Run argmax-cli once on the word "ready", silently, and throw the audio away.
+
+    Each speak() starts a new argmax-cli process. We measured the first run
+    after a while at ~20 s and later runs at ~5 s (likely macOS caching the
+    model files). Doing that slow first run here, at startup, means the
+    patient's first real sentence gets the fast path.
+    Returns True if it worked."""
+    fd, path = tempfile.mkstemp(suffix=".wav", prefix="bridge_warm_")
+    os.close(fd)
+    try:
+        subprocess.run(
+            [ARGMAX_CLI, "tts", "--text", "ready",
+             "--output-path", path[:-4], "--output-format", "wav"],   # no --play: silent
+            cwd=ARGMAX_DIR, check=True, timeout=timeout_s,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return True
+    except (subprocess.SubprocessError, OSError):
+        return False
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
 def speak(text, timeout_s=TTS_TIMEOUT_S):
     """Speak text out loud (waits until done). Returns which engine was used.
     Same arguments as lamp-robot: argmax-cli first, macOS `say` if that fails."""

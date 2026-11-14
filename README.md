@@ -68,7 +68,9 @@ cd ~/bridge
 .venv/bin/python main.py
 ```
 
-On start, Bridge sends Bonsai a tiny request so the model is loaded, and prints **Bonsai warm**.
+On start, Bridge sends Bonsai a tiny request so the model is loaded (**Bonsai warm**),
+then silently runs argmax-cli once on the word "ready" so the first spoken
+sentence isn't slow (**Speech warm**). Both print how long they took.
 
 | Key | Action |
 |---|---|
@@ -82,11 +84,17 @@ Nothing is ever spoken unless the patient presses 1, 2 or 3.
 
 ### First-person filter
 
-After Bonsai answers, any option that ends with "?" or starts with "Do you",
-"Would you", "Are you" or "Can you" is dropped, because those read like
-someone talking *to* the patient. The filter is skipped if the patient's own
-fragments look like a question (a fragment ends in "?" or contains
-who/what/where/when/why/how/which). If fewer than 2 options survive, Bonsai is
+After Bonsai answers, options that sound like someone talking *to* the patient
+are dropped:
+- they start with "Do you", "Would you" or "Are you", **or**
+- they contain "you/your" but no "I/me/my".
+
+So "Could I have a blanket?" and "Can you help me call my daughter?" are kept,
+while "Do you want cold water?" and "Can you turn that down?" are dropped.
+
+The filter is skipped if the patient's fragments contain
+who/what/where/when/why/how. Whisper's "?" is ignored, because it adds one
+whenever the voice rises ("Want?"). If fewer than 2 options survive, Bonsai is
 asked once more. So sometimes only 1 or 2 options are shown.
 
 ### Urgent alert
@@ -115,17 +123,22 @@ With no `--pick`, nothing is spoken. `--pointing` stands in for the future camer
 ## eval.py: score Bonsai on the test cases
 
 ```bash
-.venv/bin/python eval.py
+.venv/bin/python eval.py           # ask Bonsai about every case, then judge them
+.venv/bin/python eval.py --judge   # judge saved results again, no Bonsai calls
 ```
 
-Only LM Studio is needed (no WhisperKit, no audio). For each case in
-`test_phrases.txt` it runs the urgent check, then Bonsai plus the filter, and prints:
-- the options, plus any that the filter dropped
-- a keyword-overlap score against the expected sentence: **HIT** ≥ 0.5,
-  **UNSURE** 0.25–0.5 (judge these yourself), **MISS** < 0.25
-- whether the URGENT case fired the keyword alert
-- the hit rate on the 14 normal cases **with** and **without** `pointing_at`, side by side
+Only LM Studio is needed (no WhisperKit, no audio). Run it in a terminal.
 
-The keyword score is rough. It counts shared words, not meaning, so
-"I'm not taking this apple" scores as a hit for "I'd like the apple". Read the
-options yourself before trusting the number.
+1. **Generate:** each case in `test_phrases.txt` goes through the urgent check,
+   then Bonsai plus the filter. The 14 normal cases run twice, **with** and
+   **without** `pointing_at`. Everything is saved to `eval_results.csv`.
+2. **Judge:** for each row you see the expected sentence and the options, and type
+   **y** (an option says what the patient meant), **n**, **s** (skip) or
+   **q** (save and quit). Each answer is saved right away. `--judge` only asks
+   about rows that aren't marked yet; to redo one, clear its `judge` cell in the CSV.
+   The URGENT case is judged automatically (did the alert fire?).
+3. **Summary:** your hit rate with vs. without pointing, side by side, plus the
+   keyword-overlap score as a rough second column, and average Bonsai time.
+
+The keyword score counts shared words, not meaning. "I'm not taking this apple"
+scores well for "I'd like the apple", so trust your y/n over it.
